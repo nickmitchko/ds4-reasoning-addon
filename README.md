@@ -4,7 +4,7 @@ Serve the **DS4 CoLaR reasoning compression head** on a DeepSeek-V4-Flash backbo
 under vLLM — so the model **reasons in a compressed latent space** instead of
 emitting a token-by-token chain of thought.
 
-- **Weights** — <https://huggingface.co/nmitchko/deepseek-v4-Flash-CoLaR>
+- **Weights** — <https://huggingface.co/nmitchko/DeepSeek-V4-Flash-0731-Latent-Reasoning> (backbone + head, one repo)
 - **Engine** — <https://github.com/nickmitchko/vllm-ds4-sm120> (required; upstream vLLM cannot serve this model)
 - **Start here** — [`release/README-RELEASE.md`](release/README-RELEASE.md) for install, GPU sizing and every knob
 
@@ -12,7 +12,7 @@ emitting a token-by-token chain of thought.
 pip install -e . --no-deps
 pip install -r release/requirements-serve.txt \
     --extra-index-url https://flashinfer.ai/whl/cu130/torch2.11
-HEAD_BUNDLE=/path/to/reasoning_head_final.pt release/serve_ds4_reasoning.sh
+release/serve_ds4_reasoning.sh          # resolves the head from the model repo
 ```
 
 Requires **≥192 GiB VRAM** (verified on 2× RTX PRO 6000, 96 GiB, sm120) and a CUDA
@@ -41,7 +41,9 @@ This runs **batched across concurrent requests and on the cudagraph fast path**
 (no `enforce_eager`, no `--max-num-seqs 1`), and supports streaming.
 
 **Injection needs a checkpoint trained with a decoder.** Legacy head-only
-checkpoints load but are not injectable.
+checkpoints load but are not injectable. Both `.safetensors` (what the model repo
+ships) and `.pt` bundles are accepted; geometry is read from the checkpoint's own
+metadata, so nothing needs configuring.
 
 ## How injection works
 
@@ -91,7 +93,7 @@ configuration. To wire it by hand, the minimum is:
 
 ```bash
 export VLLM_PLUGINS=ds4_reasoning
-export VLLM_DS4_REASONING_CKPT=/path/to/reasoning_head_final.pt
+export VLLM_DS4_REASONING_CKPT=/path/to/latent_reasoning_head.safetensors
 export VLLM_DS4_REASONING_CAPTURE_LAYER=35   # anchor-store feedback signal
 export VLLM_ALLOW_INSECURE_SERIALIZATION=1   # collective_rpc callable dispatch
 export CUDA_HOME=/usr/local/cuda-13.0 PATH=/usr/local/cuda-13.0/bin:$PATH

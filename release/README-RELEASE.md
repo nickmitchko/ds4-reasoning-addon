@@ -1,8 +1,10 @@
-# Serving the DS4 CoLaR Reasoning Head
+# Serving DS4 Latent Reasoning
 
-Everything needed to serve the [CoLaR reasoning compression head](https://huggingface.co/nmitchko/deepseek-v4-Flash-CoLaR)
-on a DeepSeek-V4-Flash backbone: pinned requirements, a serve script, and hardware
-guidance.
+Everything needed to serve
+[`nmitchko/DeepSeek-V4-Flash-0731-Latent-Reasoning`](https://huggingface.co/nmitchko/DeepSeek-V4-Flash-0731-Latent-Reasoning) —
+a complete model that ships the NVFP4 backbone, the DSpark draft block and the
+trained latent reasoning head in one repo: pinned requirements, a serve script,
+and hardware guidance.
 
 The head makes the model **reason in a compressed latent space** instead of
 spelling out a token-by-token chain of thought. The backbone prefills your prompt
@@ -11,9 +13,13 @@ once, then takes autoregressive *latent* steps — each step's input embedding i
 stop head decides when reasoning is done, emits `</think>`, and lets the answer
 decode as normal tokens.
 
-- **Weights** — <https://huggingface.co/nmitchko/deepseek-v4-Flash-CoLaR>
+- **Weights** — <https://huggingface.co/nmitchko/DeepSeek-V4-Flash-0731-Latent-Reasoning> (backbone + head, one repo)
 - **Engine** — the DS4 SM120 vLLM fork, <https://github.com/nickmitchko/vllm-ds4-sm120> (branch `ds4-sm120-preview-dev`)
 - **Addon** — this repository, <https://github.com/nickmitchko/ds4-reasoning-addon>
+
+The model card documents the weights and their measured BBH score. This file
+documents the **runtime that drives the latent loop** — the piece the model card
+notes is not shipped there. You need both.
 
 ---
 
@@ -69,41 +75,52 @@ that don't point at the cause:
 
 ### 3. The reasoning addon
 
-From the root of this repository:
-
 ```bash
 pip install -e . --no-deps
 ```
 
 Installing does nothing on its own — the plugin stays **dormant** until
 `VLLM_DS4_REASONING_CKPT` is set, so it is safe to leave installed. If you'd
-rather not install it, pass `ADDON_DIR=/path/to/ds4-reasoning-addon` to the serve
+rather not install it, pass `ADDON_DIR=/path/to/vllm-ds4-reasoning` to the serve
 script and it goes on `PYTHONPATH` instead.
 
 ### 4. Weights
 
+One repo carries the backbone, the DSpark draft block and the head:
+
 ```bash
-export HF_HUB_ENABLE_HF_TRANSFER=1
-huggingface-cli download MJPansa/DeepSeek-V4-Flash-0731-NVFP4   # ~164 GiB
-huggingface-cli download nmitchko/deepseek-v4-Flash-CoLaR       # ~136 MiB
+huggingface-cli download nmitchko/DeepSeek-V4-Flash-0731-Latent-Reasoning   # ~164 GiB
 ```
+
+`vllm serve` will also fetch this on first run, so downloading ahead of time is
+optional — it just makes the wait visible.
 
 ---
 
 ## Serve
 
+The default model bundles its own head, so no arguments are needed:
+
 ```bash
-HEAD_BUNDLE=/path/to/reasoning_head_final.pt ./serve_ds4_reasoning.sh
+./serve_ds4_reasoning.sh
+```
+
+The script resolves `latent_reasoning_head.safetensors` from that repo (~152 MiB,
+cached after the first run) and points the rider at it. To serve a head you
+trained yourself, or a different base, pass one explicitly:
+
+```bash
+HEAD_BUNDLE=/path/to/head.safetensors ./serve_ds4_reasoning.sh
 ```
 
 ### Requests must ask for thinking
 
 ```bash
 curl localhost:8001/v1/chat/completions -H 'content-type: application/json' -d '{
-  "model": "MJPansa/DeepSeek-V4-Flash-0731-NVFP4",
+  "model": "nmitchko/DeepSeek-V4-Flash-0731-Latent-Reasoning",
   "messages": [{"role": "user", "content": "Write a Python LRU cache."}],
   "chat_template_kwargs": {"thinking": true},
-  "max_tokens": 2048
+  "max_tokens": 4096
 }'
 ```
 
@@ -128,7 +145,7 @@ same thing, and works on `/v1/messages` too.
 ## GPU recommendations
 
 The backbone is NVFP4 and lands at roughly **79 GiB of weights per GPU at TP=2**
-(~158–164 GiB total, depending on base). The head itself is ~136 MiB and about 1%
+(~158–164 GiB total, depending on base). The head itself is ~152 MiB and about 1%
 of a decode step — the MoE dominates. So sizing is entirely about fitting weights
 plus the fp8 KV cache.
 
@@ -203,8 +220,9 @@ Environment variables read by `serve_ds4_reasoning.sh`:
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `HEAD_BUNDLE` | — | Head checkpoint. Required unless `RIDER=0`. |
-| `MODEL` | `MJPansa/DeepSeek-V4-Flash-0731-NVFP4` | Base checkpoint. |
+| `HEAD_BUNDLE` | *(auto)* | Head checkpoint, `.safetensors` or `.pt`. Empty resolves the one bundled with `MODEL`. |
+| `MODEL` | `nmitchko/DeepSeek-V4-Flash-0731-Latent-Reasoning` | Model to serve. |
+| `BUNDLED_HEAD_FILE` | `latent_reasoning_head.safetensors` | Head filename to look for inside `MODEL`. |
 | `SPEC_METHOD` | `dspark` | `dspark` \| `mtp` \| `none`. Must match `MODEL`. |
 | `TP` | `2` | Tensor-parallel size. |
 | `MAX_MODEL_LEN` | `262144` | Context window. |

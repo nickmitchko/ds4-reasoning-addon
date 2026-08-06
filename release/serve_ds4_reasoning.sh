@@ -7,19 +7,21 @@
 # the latent phase and emits </think>, after which the answer decodes as normal
 # tokens. Batched across concurrent requests and cudagraph-safe (no enforce_eager).
 #
-# Quick start (defaults are the recommended configuration):
+# Quick start -- the defaults are the recommended configuration, and the default
+# model ships its own head, so this needs no arguments:
 #
-#   HEAD_BUNDLE=/path/to/reasoning_head_final.pt ./serve_ds4_reasoning.sh
+#   ./serve_ds4_reasoning.sh
 #
 # Then, note the `thinking` kwarg -- WITHOUT it the model emits garbage:
 #
 #   curl localhost:8001/v1/chat/completions -H 'content-type: application/json' -d '{
-#     "model": "MJPansa/DeepSeek-V4-Flash-0731-NVFP4",
+#     "model": "nmitchko/DeepSeek-V4-Flash-0731-Latent-Reasoning",
 #     "messages": [{"role":"user","content":"Write a Python LRU cache."}],
 #     "chat_template_kwargs": {"thinking": true},
-#     "max_tokens": 2048 }'
+#     "max_tokens": 4096 }'
 #
 # Other useful invocations:
+#   HEAD_BUNDLE=/path/to/head.safetensors ./serve_ds4_reasoning.sh   # explicit head
 #   RIDER=0 ./serve_ds4_reasoning.sh                 # bare backbone A/B baseline
 #   DEBUG=1 ./serve_ds4_reasoning.sh                 # per-request latent stats
 #   MAX_MODEL_LEN=32768 TP=1 ./serve_ds4_reasoning.sh
@@ -29,18 +31,23 @@
 set -euo pipefail
 
 # --- what to serve ------------------------------------------------------------
-# The head bundle (.pt or .safetensors) produced by training / downloaded from
-# the model repo. REQUIRED unless RIDER=0.
+# The head bundle (.safetensors or .pt). Leave EMPTY with the default model and
+# the script resolves the head that model repo ships (see below). Required only
+# when serving a base that carries no head of its own.
 HEAD_BUNDLE="${HEAD_BUNDLE:-}"
 
-# Base checkpoint. The two supported bases have byte-identical bodies and
+# Base checkpoint. All three supported bases have byte-identical bodies and
 # tokenizers -- all 133,660 non-draft weight names match -- so ONE head bundle
-# serves both. They differ ONLY in the speculative draft block they ship, which
+# serves any of them. They differ in the speculative draft block they ship, which
 # is why MODEL and SPEC_METHOD must move together:
-#   MJPansa/DeepSeek-V4-Flash-0731-NVFP4  3-layer DSpark draft  -> SPEC_METHOD=dspark
-#   nvidia/DeepSeek-V4-Flash-NVFP4        1-layer MTP draft     -> SPEC_METHOD=mtp
-MODEL="${MODEL:-MJPansa/DeepSeek-V4-Flash-0731-NVFP4}"
+#   nmitchko/DeepSeek-V4-Flash-0731-Latent-Reasoning  DSpark + BUNDLED HEAD -> dspark
+#   MJPansa/DeepSeek-V4-Flash-0731-NVFP4              3-layer DSpark draft  -> dspark
+#   nvidia/DeepSeek-V4-Flash-NVFP4                    1-layer MTP draft     -> mtp
+MODEL="${MODEL:-nmitchko/DeepSeek-V4-Flash-0731-Latent-Reasoning}"
 SPEC_METHOD="${SPEC_METHOD:-dspark}"
+
+# Filename of the head inside a model repo that bundles one.
+BUNDLED_HEAD_FILE="${BUNDLED_HEAD_FILE:-latent_reasoning_head.safetensors}"
 
 PORT="${PORT:-8001}"
 TP="${TP:-2}"
@@ -102,16 +109,39 @@ case "$MODEL:$SPEC_METHOD" in
         exit 1 ;;
 esac
 
-if [ "$RIDER" = "1" ]; then
-    if [ -z "$HEAD_BUNDLE" ]; then
-        echo "ERROR: set HEAD_BUNDLE=/path/to/reasoning_head_final.pt" >&2
-        echo "       (or RIDER=0 to serve the bare backbone with no head)" >&2
-        exit 1
+if [ "$RIDER" = "1" ] && [ -z "$HEAD_BUNDLE" ]; then
+    # A local model directory containing the head: use it directly.
+    if [ -f "$MODEL/$BUNDLED_HEAD_FILE" ]; then
+        HEAD_BUNDLE="$MODEL/$BUNDLED_HEAD_FILE"
+        echo "Using the head bundled with $MODEL"
+    else
+        # Otherwise pull just that one file from the Hub (~152 MiB). This is a
+        # no-op once cached, and deliberately does NOT fetch the 164 GiB body --
+        # vllm serve does that itself.
+        echo "Resolving the head bundled with $MODEL ($BUNDLED_HEAD_FILE)..."
+        HEAD_BUNDLE="$(python3 - "$MODEL" "$BUNDLED_HEAD_FILE" <<'PY' 2>/dev/null || true
+import sys
+try:
+    from huggingface_hub import hf_hub_download
+    print(hf_hub_download(sys.argv[1], sys.argv[2]))
+except Exception:
+    sys.exit(1)
+PY
+)"
+        if [ -z "$HEAD_BUNDLE" ]; then
+            echo "ERROR: could not resolve a head for $MODEL." >&2
+            echo "       That model repo may not bundle one. Either point at a head:" >&2
+            echo "         HEAD_BUNDLE=/path/to/head.safetensors $0" >&2
+            echo "       or serve the bare backbone with no latent reasoning:" >&2
+            echo "         RIDER=0 $0" >&2
+            exit 1
+        fi
     fi
-    if [ ! -f "$HEAD_BUNDLE" ]; then
-        echo "ERROR: head bundle not found: $HEAD_BUNDLE" >&2
-        exit 1
-    fi
+fi
+
+if [ "$RIDER" = "1" ] && [ ! -f "$HEAD_BUNDLE" ]; then
+    echo "ERROR: head bundle not found: $HEAD_BUNDLE" >&2
+    exit 1
 fi
 
 # --- environment --------------------------------------------------------------
