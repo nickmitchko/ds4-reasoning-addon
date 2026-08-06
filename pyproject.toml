@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vllm-ds4-reasoning"
+version = "0.1.0"
+description = "Opt-in vLLM addon that injects DS4 CoLaR reasoning-head latents into the DeepSeek-V4 backbone for closed-loop latent reasoning."
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.10"
+dependencies = ["torch"]
+
+[project.urls]
+Homepage = "https://github.com/nickmitchko/ds4-reasoning-addon"
+Weights = "https://huggingface.co/nmitchko/deepseek-v4-Flash-CoLaR"
+Engine = "https://github.com/nickmitchko/vllm-ds4-sm120"
+
+[project.entry-points."vllm.general_plugins"]
+# vLLM discovers this under the vllm.general_plugins group and calls it in every
+# process (incl. TP workers). Gate loading with VLLM_PLUGINS=ds4_reasoning to
+# load ONLY this plugin, or leave VLLM_PLUGINS unset to load all installed ones.
+ds4_reasoning = "vllm_ds4_reasoning:register"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["vllm_ds4_reasoning*"]

@@ -1,0 +1,77 @@
+# Serving requirements for the DS4 CoLaR reasoning head on DeepSeek-V4-Flash.
+#
+# These are the versions this stack is actually served with on 2x RTX PRO 6000
+# (sm120 / compute capability 12.0), CUDA 13.0, Python 3.12.8. Exact pins, not
+# ranges: the sm120 path is version-sensitive in ways that fail at engine
+# startup or -- worse -- silently degrade output quality.
+#
+#   pip install -r requirements-serve.txt
+#
+# vLLM itself is NOT here. It must be built from the DS4 SM120 fork; upstream
+# vLLM cannot serve this model (see README-RELEASE.md, "Install the engine").
+#
+# ---------------------------------------------------------------------------
+# Core
+# ---------------------------------------------------------------------------
+torch==2.11.0            # +cu130 build; install from the cu130 index (see below)
+transformers==5.12.1
+tokenizers==0.22.2
+safetensors==0.8.0       # reads the head bundle's .safetensors
+numpy==2.3.5
+regex==2026.6.28         # imported directly by the fork's quant_config.py
+sentencepiece==0.2.1
+huggingface-hub==1.21.0
+# Optional but strongly recommended -- the base checkpoint is ~160 GiB and
+# HF_HUB_ENABLE_HF_TRANSFER=1 (set by the serve script) needs this to take
+# effect. Unpinned because it is not part of the tested serving set.
+hf-transfer
+
+# ---------------------------------------------------------------------------
+# Quantization -- required, not optional
+# ---------------------------------------------------------------------------
+# The base checkpoint is NVFP4. fp_quant's FPQuantLinear REPLACES nn.Linear, so
+# without it the model does not load at all.
+fp_quant==0.3.2
+# CRITICAL: kernels>=0.15 enforces explicit version/revision on every
+# LayerRepository call, which this transformers version does not pass -> hard
+# error at import. Do not relax this pin.
+kernels==0.14.1
+
+# ---------------------------------------------------------------------------
+# FlashInfer -- all three packages MUST be the same version
+# ---------------------------------------------------------------------------
+# The DeepSeek-V4 sparse-MLA kernel on sm120 lives ONLY in the 0.6.14
+# flashinfer_jit_cache/jit_cache/sparse_mla_sm120/ layout. Skew between these
+# three is a known trap and produces one of two startup failures:
+#   RuntimeError: flashinfer-jit-cache version (...) does not match flashinfer
+#   ModuleNotFoundError: No module named 'flashinfer.mla._sparse_mla_sm120'
+# An editable vLLM reinstall is what usually desynchronizes them -- re-pin after
+# any `pip install -e`.
+flashinfer-python==0.6.14
+flashinfer-cubin==0.6.14
+flashinfer-jit-cache==0.6.14+cu130
+
+# ---------------------------------------------------------------------------
+# Engine runtime deps
+# ---------------------------------------------------------------------------
+cuda-python==13.3.1
+nvidia-cutlass-dsl==4.5.2   # FLASHINFER_CUTLASS is the only viable MoE backend here
+triton==3.6.0
+xgrammar==0.2.3             # structured output / tool calling
+openai==2.44.0              # only for the sample client in serve_ds4_reasoning.sh
+
+# ---------------------------------------------------------------------------
+# Install notes
+# ---------------------------------------------------------------------------
+# torch cu130 and the flashinfer jit-cache are not on plain PyPI:
+#
+#   pip install torch==2.11.0 --index-url https://download.pytorch.org/whl/cu130
+#   pip install -r requirements-serve.txt \
+#       --extra-index-url https://flashinfer.ai/whl/cu130/torch2.11
+#
+# A CUDA 13.0 *toolkit* (nvcc) is also required at runtime, not just the driver:
+# the sm120 MoE kernels JIT-compile on first load, and an older nvcc fails with
+# "No supported CUDA architectures found for major versions [12]".
+#
+#   export CUDA_HOME=/usr/local/cuda-13.0
+#   export PATH=/usr/local/cuda-13.0/bin:$PATH
