@@ -215,5 +215,3 @@ class ReasoningInjector:
             )
             for i in range(n)
         ]
-
-# sync round-trip probe -- remove me
