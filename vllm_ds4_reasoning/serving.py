@@ -367,6 +367,10 @@ async def _ensure_installed(engine, injector, cfg):
             hidden_size=int(b.hidden_size), latent_dim=int(b.latent_dim),
             use_stop=cfg["use_stop"], stop_threshold=cfg["stop_threshold"],
             min_latent=cfg["min_latent"], think_end_token_id=think_end_id,
+            # The bundle's ARCHITECTURE. Without it the worker builds the v1
+            # classes and a v2 bundle dies on a net.4 size mismatch, so every
+            # Aux Head v4 checkpoint was unservable through this path.
+            arch=getattr(b, "arch", "v1"), bank_m=getattr(b, "bank_m", 1),
         ))
     except Exception as e:  # noqa: BLE001
         # ds4_setup_latent validates the ENGINE config (prompt-embeds, and the
