@@ -1,10 +1,15 @@
 """Load reasoning-head bundles produced by the trainer.
 
-Reads the v2/v3 self-describing bundle (head + decoder + target_proj +
+Reads the v2/v3/v4 self-describing bundle (head + decoder + target_proj +
 geometry), from either a torch ``.pt`` pickle or a ``.safetensors`` file --
 published model repos ship the latter. Legacy bare-head state_dicts are accepted
 for the head alone, but injection REQUIRES a decoder, so those raise a clear
 error when used for hosting.
+
+format_version 4 (Aux Head v4) additionally declares ``arch``: "v2" bundles are
+the latent-BANK head, a different module class, not a wider v1. Dispatch is on
+``arch`` and never on the version number -- the version is descriptive metadata,
+while arch is the only field that says which classes to construct.
 """
 
 import json
@@ -16,7 +21,8 @@ from typing import Optional
 import torch
 from torch import nn
 
-from .models import LatentDecoder, ReasoningCompressionHead
+from .models import (LatentDecoder, LatentDecoderV2, ReasoningCompressionHead,
+                     ReasoningCompressionHeadV2)
 
 logger = logging.getLogger(__name__)
 
@@ -33,6 +39,10 @@ class ReasoningBundle:
     source_layer: Optional[int]
     target_layer: Optional[int]
     compression_factor: Optional[int]
+    # Which head architecture this bundle actually is. Defaulted so every
+    # existing construction site (and every pre-v4 bundle) keeps meaning v1.
+    arch: str = "v1"
+    bank_m: int = 1
 
     @property
     def injectable(self) -> bool:
@@ -123,9 +133,22 @@ def load_bundle(path: str, map_location="cpu") -> ReasoningBundle:
     # different width.
     mlp_dim = cfg.get("mlp_dim")
 
-    head = ReasoningCompressionHead(
-        hidden_size=hidden_size, latent_dim=latent_dim, mlp_dim=mlp_dim
-    )
+    # Build the architecture the bundle was TRAINED as. Constructing v1 for a v2
+    # bundle is not a near miss: the v2 trunk emits 2*M*latent_dim and its stop
+    # head takes hidden+latent+2 inputs, so it raises a size mismatch -- and
+    # under a strict=False load it would warm-start nothing and serve noise.
+    arch = str(cfg.get("arch", "v1")).lower()
+    bank_m = int(cfg.get("bank_m", 1) or 1)
+
+    if arch == "v2":
+        head = ReasoningCompressionHeadV2(
+            hidden_size=hidden_size, latent_dim=latent_dim, bank_m=bank_m,
+            mlp_dim=mlp_dim,
+        )
+    else:
+        head = ReasoningCompressionHead(
+            hidden_size=hidden_size, latent_dim=latent_dim, mlp_dim=mlp_dim
+        )
     # strict=False: v2 bundles have no stop_head; it keeps its fresh init.
     incompatible = head.load_state_dict(obj["reasoning_head"], strict=False)
     if incompatible.unexpected_keys:
@@ -148,9 +171,14 @@ def load_bundle(path: str, map_location="cpu") -> ReasoningBundle:
 
     decoder = None
     if obj.get("decoder") is not None:
-        decoder = LatentDecoder(
-            hidden_size=hidden_size, latent_dim=latent_dim, mlp_dim=mlp_dim
-        )
+        if arch == "v2":
+            decoder = LatentDecoderV2(
+                hidden_size=hidden_size, latent_dim=latent_dim, mlp_dim=mlp_dim
+            )
+        else:
+            decoder = LatentDecoder(
+                hidden_size=hidden_size, latent_dim=latent_dim, mlp_dim=mlp_dim
+            )
         decoder.load_state_dict(obj["decoder"])
         decoder.eval()
 
@@ -166,4 +194,5 @@ def load_bundle(path: str, map_location="cpu") -> ReasoningBundle:
         source_layer=cfg.get("source_layer"),
         target_layer=cfg.get("target_layer"),
         compression_factor=cfg.get("compression_factor"),
+        arch=arch, bank_m=bank_m,
     )
