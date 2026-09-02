@@ -5,7 +5,7 @@ under vLLM — so the model **reasons in a compressed latent space** instead of
 emitting a token-by-token chain of thought.
 
 - **Weights** — <https://huggingface.co/nmitchko/DeepSeek-V4-Flash-0731-Latent-Reasoning> (backbone + head, one repo)
-- **Engine** — <https://github.com/nickmitchko/vllm-ds4-sm120> (required; upstream vLLM cannot serve this model)
+- **Engine** — the DS4 SM120 vLLM fork, `ds4` branch — `git clone -b ds4 https://github.com/nickmitchko/vllm-ds4-sm120.git` (required; upstream vLLM cannot serve this model)
 - **Start here** — [`release/README-RELEASE.md`](release/README-RELEASE.md) for install, GPU sizing and every knob
 
 ```bash

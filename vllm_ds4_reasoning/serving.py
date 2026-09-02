@@ -31,7 +31,7 @@ otherwise a fixed ``max_latent`` cap bounds the latent phase.
 
 Output-token floor (VLLM_DS4_REASONING_MIN_OUTPUT_TOKENS, default 2048): the
 latent <think> phase consumes output tokens before the answer, so a client that
-requests a small ``max_tokens`` (notably Claude Code) can have its whole budget
+requests a small ``max_tokens`` (e.g. a long-system-prompt client) can have its whole budget
 spent thinking, yielding an empty text block (stop_reason=length). The hook
 raises each request's output budget to at least this floor PLUS the request's
 latent-step cap (each latent step bills one reserved accounting token), so the
@@ -39,6 +39,8 @@ floor bounds the answer alone; override per request via the
 ``x-ds4-min-output-tokens`` header, or set the floor to 0 to disable.
 """
 
+import asyncio
+import json
 import logging
 import os
 
@@ -52,7 +54,7 @@ ENV_STOP_THRESH = "VLLM_DS4_REASONING_STOP_THRESHOLD"
 # Output-token floor. The closed-loop latent reasoning phase consumes output
 # tokens inside <think> before the answer; if the client's max_tokens is smaller
 # than the reasoning needs, the budget is spent thinking and no answer is emitted
-# (empty text block, stop_reason=length). Clients like Claude Code send a modest
+# (empty text block, stop_reason=length). Clients that send a modest
 # max_tokens that is too low for the head. We FLOOR the request's output budget to
 # this value so the answer always has room. 0 disables the floor.
 ENV_MIN_OUTPUT = "VLLM_DS4_REASONING_MIN_OUTPUT_TOKENS"
@@ -67,13 +69,250 @@ ENV_MIN_OUTPUT = "VLLM_DS4_REASONING_MIN_OUTPUT_TOKENS"
 # stranded. Default ON -- an answer no client can read is not a useful default; set
 # to 0 to restore the previous behavior for A/B measurement.
 ENV_CLOSE_THINK = "VLLM_DS4_REASONING_CLOSE_THINK"
+# Prepended system instruction that fixes the ANSWER REGISTER. Empty = disabled.
+#
+# WHY (measured 2026-08-19/20, n=8 and n=20 per arm on the SWE-bench-harness prompt):
+# after the three latent-seam fixes the rider's output is token-clean and does not
+# collapse, but the answer is written in the SCRATCHPAD voice -- "We need to design a
+# harness... The user wants a detailed explanation" -- because the latent phase ends
+# while the model is still mid-reasoning and the only place left to continue is the
+# answer. Three training-side attempts failed to move this (two dspark Markov-head
+# A/Bs, then H5 answer-register supervision, which converged to its own floor and
+# measured 8.1 -> 9.5 markers/kw). It is not a head defect.
+#
+# scripts/probe_latent_depth.py showed the register tracks REASONING BUDGET: scratch
+# markers fall monotonically with latent depth (12.6 -> 0.9 /kw over n=8..512) and
+# with the learned-stop bar (11.8 -> 4.1 /kw over thr 0.5..0.99). Both of those
+# knobs cost decode steps. This instruction buys most of the same effect for the
+# price of a few prompt tokens (measured +0.0s serially, 11.0 -> 1.2 /kw), which is
+# why it is the default half of the fix and a higher stop threshold is not.
+#
+# It is a SYSTEM message, prepended only when the request has no system message of
+# its own -- overriding a client's system prompt would be a much bigger intervention
+# than fixing a register. Set to the empty string to disable.
+ENV_ANSWER_REGISTER = "VLLM_DS4_REASONING_ANSWER_REGISTER"
+ANSWER_REGISTER_DEFAULT = (
+    "Answer the user's question directly and in a clean expository register. "
+    "Do not narrate your own reasoning process, and do not use phrases like "
+    "\"we need to\", \"let's\", or \"the user asks\"."
+)
 # The literal reasoning-end token. DeepSeek's think tags are plain ASCII (unlike
 # the FULL-WIDTH role markers) and tokenize to a single id (verified: 128822). The
 # id is resolved from the ENGINE's tokenizer at arm time rather than hardcoded.
 THINK_END_TOKEN = "</think>"
 
+# --- streamed latent-tick signaling ------------------------------------------
+# During the latent  thinking phase the runner emits no stream-visible tokens, so
+# a client sees a dead connection until the first answer byte. To make the phase
+# "active but empty" (approved UX: no visible text; the client's indicator is
+# duration-driven on an OPEN thinking block), we synthesize per-latent-step ticks
+# into the OpenAI chunk stream. The tick is carried in DeltaMessage.reasoning --
+# NOT content -- so the Anthropic converter routes it into a thinking block and
+# the client never surfaces it, reuses it, or counts it as an answer token. The
+# value defaults to a zero-width space: non-empty (the Anthropic adapter drops
+# empty reasoning deltas and never opens the block on ""), but renders as nothing.
+# Set to "" for truly-empty reasoning deltas (OpenAI clients see `reasoning:""`;
+# no thinking block opens on /v1/messages).
+ENV_TICK_TEXT = "VLLM_DS4_REASONING_TICK_TEXT"
+TICK_TEXT = os.environ.get(ENV_TICK_TEXT, "​")
+# Poll cadence for the runner's per-request latent stats (latent steps run ~93 ms
+# each, so 50 ms catches every step; fine under batching too).
+_TICK_POLL_INTERVAL = 0.05
+# How many consecutive polls with no runner entry for this prefix before we assume
+# the phase never started (rider not armed / no latent) and stop the tick poller.
+_TICK_MAX_SILENT_POLLS = 60
+
+
+def _load_prometheus():
+    """Import prometheus_client lazily; None when unavailable (offline processes
+    that import this module but never serve, where /metrics does not exist)."""
+    global _prom_client
+    if _prom_client is None:
+        try:
+            import prometheus_client
+            _prom_client = prometheus_client
+        except Exception:  # noqa: BLE001 -- not a serve process
+            _prom_client = False
+    return _prom_client or None
+
+
+_prom_client = None
+LPS_COUNTER = None
+LPS_HISTOGRAM = None
+_LPS_BUCKETS = (1, 2, 4, 8, 16, 32, 64, 128)
+
+
+def _init_lps_metrics():
+    """Register the LPS metrics on the default REGISTRY (where this serve exposes
+    /metrics). Idempotent; swallows AlreadyRegisteredError on addon reloads."""
+    global LPS_COUNTER, LPS_HISTOGRAM
+    if LPS_COUNTER is not None:
+        return
+    prom = _load_prometheus()
+    if prom is None:
+        return
+    if LPS_COUNTER is None:
+        try:
+            LPS_COUNTER = prom.Counter(
+                "vllm:ds4_latent_steps_total",
+                "Latent thinking steps executed by the closed-loop rider.",
+            )
+        except Exception:  # noqa: BLE001 -- already registered
+            LPS_COUNTER = None
+    if LPS_HISTOGRAM is None:
+        try:
+            LPS_HISTOGRAM = prom.Histogram(
+                "vllm:ds4_latent_steps_per_request",
+                "Latent thinking steps per request (closed-loop rider).",
+                buckets=list(_LPS_BUCKETS),
+            )
+        except Exception:  # noqa: BLE001
+            LPS_HISTOGRAM = None
+    if LPS_COUNTER is None and LPS_HISTOGRAM is None:
+        _prom_client = False  # registration failed; stop retrying
+
+
+def _record_lps(stats_entry):
+    """Increment the LPS metrics for THIS request's latent steps, if any.
+
+    ``stats_entry`` is one runner {req_id -> {steps, ...}} hit (or None); the
+    caller passes only the entry matched for this request. Never raises: a metrics
+    hiccup must not break serving.
+    """
+    if not stats_entry:
+        return
+    steps = int(stats_entry.get("steps") or 0)
+    if steps <= 0:
+        return
+    _init_lps_metrics()
+    try:
+        if LPS_COUNTER is not None:
+            LPS_COUNTER.inc(steps)
+        if LPS_HISTOGRAM is not None:
+            LPS_HISTOGRAM.observe(steps)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+async def _record_lps_for_request(engine, internal_prefix):
+    """Fetch the runner stats once and record LPS for the one matching request."""
+    try:
+        stats_ranks = await engine.collective_rpc(_rpc_latent_stats)
+    except Exception:  # noqa: BLE001 -- never break serving
+        return
+    stats = next((s for s in stats_ranks if s), {})
+    mine = {k: v for k, v in stats.items()
+            if k.startswith(internal_prefix)}
+    if not mine:
+        return
+    _record_lps(next(iter(mine.values())))
+
+
+def _serialize_tick_chunk(rid, created, model, tick_text=TICK_TEXT):
+    """Serialize one latent tick as an OpenAI streaming chunk string.
+
+    ``delta.reasoning`` (not ``content``) so it lands in the thinking block on the
+    Anthropic side. No ``usage``, no ``token_ids``, no ``logprobs``: the tick adds
+    nothing to the client's billed/context token counts -- the real count ships in
+    the engine's final usage chunk and already includes latent pad tokens once.
+    """
+    data = {
+        "id": rid,
+        "object": "chat.completion.chunk",
+        "created": created,
+        "model": model,
+        "choices": [
+            {
+                "index": 0,
+                "delta": {"reasoning": tick_text},
+                "logprobs": None,
+                "finish_reason": None,
+                "stop_reason": None,
+            }
+        ],
+    }
+    return f"data: {json.dumps(data)}\n\n"
+
+
+async def _wrap_with_latent_ticks(upstream, engine, internal_prefix):
+    """Merge synthesized latent ticks into a streaming chunk generator.
+
+    ``upstream`` yields serialized SSE chunks (from chat_completion_stream_generator
+    or an equivalent). A background task polls the runner's per-request latent stats
+    (keyed with the ``internal_prefix`` = "chatcmpl-<request_id>-") and enqueues a
+    tick each time ``steps`` advances; the main loop drains queued ticks ahead of
+    each upstream chunk and yields them as empty-but-active thinking deltas. The
+    poller is bounded by the upstream's lifetime and stops early once stats mark the
+    phase done. Never raises: any poll/queue hiccup just skips a tick.
+    """
+    queue: asyncio.Queue[None] = asyncio.Queue()
+    stop_poll = asyncio.Event()
+    last_steps = 0
+
+    async def _poll():
+        nonlocal last_steps  # mutate the enclosing step counter across polls
+        silent = 0
+        while not stop_poll.is_set():
+            try:
+                stats_ranks = await engine.collective_rpc(_rpc_latent_stats)
+            except Exception:  # noqa: BLE001 -- transient RPC failure; retry
+                await asyncio.sleep(_TICK_POLL_INTERVAL)
+                continue
+            stats = next((s for s in stats_ranks if s), {})
+            mine = {k: v for k, v in stats.items()
+                    if k.startswith(internal_prefix)}
+            if not mine:
+                silent += 1
+                if silent >= _TICK_MAX_SILENT_POLLS:
+                    return
+                await asyncio.sleep(_TICK_POLL_INTERVAL)
+                continue
+            silent = 0
+            s = next(iter(mine.values()))
+            steps = int(s.get("steps") or 0)
+            while steps > last_steps:
+                last_steps += 1
+                queue.put_nowait(None)
+            if s.get("end") is not None:
+                return
+            await asyncio.sleep(_TICK_POLL_INTERVAL)
+
+    first_id = None
+    first_created = None
+    first_model = None
+    poller = asyncio.create_task(_poll())
+    try:
+        async for chunk in upstream:
+            if first_id is None and chunk.startswith("data:"):
+                data_str = chunk[5:].strip().rstrip("\n")
+                if data_str == "[DONE]":
+                    yield chunk
+                    continue
+                try:
+                    obj = json.loads(data_str)
+                    first_id = obj.get("id")
+                    first_created = obj.get("created")
+                    first_model = obj.get("model")
+                except Exception:  # noqa: BLE001 -- malformed chunk; pass through
+                    pass
+            while True:
+                try:
+                    queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+                if first_id is None:
+                    continue
+                yield _serialize_tick_chunk(first_id, first_created, first_model)
+            yield chunk
+    finally:
+        stop_poll.set()
+        poller.cancel()
+        # Record LPS once the stream is fully consumed: only now does the runner's
+        # stat entry hold the completed step count. No-op when stats are absent.
+        await _record_lps_for_request(engine, internal_prefix)
+
 # --- per-request HTTP HEADERS -----------------------------------------------
-# Clients that can set headers but not custom body fields (notably Claude Code
+# Clients that can set headers but not custom body fields (notably header-only clients
 # via ANTHROPIC_CUSTOM_HEADERS) can drive the reasoning head through these. They
 # work on BOTH /v1/chat/completions and /v1/messages (the Anthropic handler
 # subclasses OpenAIServingChat, so both flow through the patched
@@ -85,6 +324,7 @@ HDR_USE_STOP = "x-ds4-use-stop"              # 0/1  -> ds4_latent_use_stop
 HDR_STOP_THRESH = "x-ds4-stop-threshold"     # float-> ds4_latent_stop_threshold
 HDR_MIN_LATENT = "x-ds4-min-latent"          # int  -> ds4_latent_min_latent
 HDR_MIN_OUTPUT = "x-ds4-min-output-tokens"   # int  -> floor on request max_tokens
+HDR_ANSWER_REGISTER = "x-ds4-answer-register"  # 0/1 -> answer-register system msg
 
 _INSTALLED = False   # workers have the batched rider armed
 _PATCHED = False     # OpenAIServingChat already monkeypatched
@@ -116,7 +356,7 @@ def _apply_request_headers(request, raw_request) -> None:
     value is skipped rather than failing the request. Header values take
     precedence over any body-supplied vllm_xargs / chat_template_kwargs.
 
-    Enables clients that can only set headers (e.g. Claude Code via
+    Enables clients that can only set headers (e.g. header-only clients via
     ANTHROPIC_CUSTOM_HEADERS) to fully control the reasoning head, including over
     /v1/messages where the Anthropic->OpenAI translation drops body vllm_xargs.
     """
@@ -153,11 +393,90 @@ def _apply_request_headers(request, raw_request) -> None:
         request.vllm_xargs = xargs
 
 
+def _apply_answer_register(request, raw_request, instr) -> None:
+    """Add the answer-register instruction as a system message (ENV_ANSWER_REGISTER).
+
+    APPENDS to an existing system message rather than skipping it. Skipping would be
+    the more conservative choice, but it would make this knob inert for the client
+    that motivated it: a header-only client always sends a large system prompt, so a
+    "no system message" guard would fire on the measurement harness and never in
+    production. Appending a two-sentence register note to the end of a system prompt
+    leaves the client's own instructions in force and ahead of ours.
+
+    Skipped when ``instr`` is empty (knob off), when ``x-ds4-answer-register`` is
+    falsey (per-request opt-out), or when ``messages`` is missing / not a list (e.g. a
+    completions-shaped request). Best-effort like the header path: an unrecognized
+    request shape is left alone rather than failed. Runs BEFORE the template renders.
+
+    A system message whose ``content`` is a content-part LIST (the Anthropic and
+    newer OpenAI shape) gets an extra text part appended rather than a string concat,
+    since ``str + list`` would raise and a replaced list would drop the client's
+    prompt entirely.
+    """
+    if not instr:
+        return
+    headers = getattr(raw_request, "headers", None)
+    if headers is not None:
+        hv = headers.get(HDR_ANSWER_REGISTER)
+        if hv is not None and not _truthy(hv):
+            return
+    msgs = getattr(request, "messages", None)
+    if not isinstance(msgs, list):
+        return
+
+    def _role(m):
+        return m.get("role") if isinstance(m, dict) else getattr(m, "role", None)
+
+    def _text(m):
+        c = m.get("content") if isinstance(m, dict) else getattr(m, "content", None)
+        if isinstance(c, str):
+            return c
+        if isinstance(c, list):
+            return " ".join(p.get("text", "") for p in c if isinstance(p, dict))
+        return ""
+
+    # IDEMPOTENT: the patched handler can run more than once for one logical request
+    # (client retry, streaming re-entry), and without this the note stacks up in the
+    # system prompt on each pass.
+    if any(instr in _text(m) for m in msgs if _role(m) == "system"):
+        return
+
+    try:
+        out = list(msgs)
+        idx = next((i for i, m in enumerate(out) if _role(m) == "system"), None)
+        if idx is None:
+            out.insert(0, {"role": "system", "content": instr})
+        else:
+            m = out[idx]
+            cur = m.get("content") if isinstance(m, dict) else getattr(
+                m, "content", None)
+            if isinstance(cur, str):
+                new = cur.rstrip() + "\n\n" + instr
+            elif isinstance(cur, list):
+                new = list(cur) + [{"type": "text", "text": instr}]
+            else:
+                # Unknown content shape -- add a separate system message instead of
+                # guessing how to concatenate, so the client's prompt is untouched.
+                out.insert(idx + 1, {"role": "system", "content": instr})
+                request.messages = out
+                return
+            if isinstance(m, dict):
+                out[idx] = {**m, "content": new}
+            else:
+                out[idx] = m.model_copy(update={"content": new}) if hasattr(
+                    m, "model_copy") else m
+                if out[idx] is m:      # could not copy -> don't mutate the original
+                    out.insert(idx + 1, {"role": "system", "content": instr})
+        request.messages = out
+    except (AttributeError, ValueError, TypeError):  # frozen / validated field
+        logger.warning("DS4 answer-register instruction could not be applied.")
+
+
 def _apply_output_floor(request, raw_request, floor_default,
                         latent_default) -> None:
     """Raise the request's output-token budget to at least ``floor`` so the
     latent reasoning phase can't consume the whole budget inside <think> and
-    leave no room for the answer (the Claude-Code failure: a modest max_tokens
+    leave no room for the answer (the failure mode: a modest max_tokens
     is too low for the head, so the response is an empty text block with
     stop_reason=length). The per-request ``x-ds4-min-output-tokens`` header wins
     over the env default. A value of 0 disables the floor. We never LOWER the
@@ -405,6 +724,10 @@ def _make_patched_create(orig, injector):
         "min_output_tokens": _cfg_int(ENV_MIN_OUTPUT, 2048),
         # Emit </think> when the latent phase ends (see ENV_CLOSE_THINK).
         "close_think": os.environ.get(ENV_CLOSE_THINK, "1") == "1",
+        # Answer-register instruction (see ENV_ANSWER_REGISTER). Default ON: the
+        # rider's measured failure mode without it is an answer in scratchpad voice.
+        "answer_register": os.environ.get(ENV_ANSWER_REGISTER,
+                                          ANSWER_REGISTER_DEFAULT),
     }
 
     def _tag_request(request):
@@ -426,11 +749,12 @@ def _make_patched_create(orig, injector):
             # Header overrides FIRST: x-ds4-* headers set chat_template thinking +
             # ds4_latent_* xargs, so they win over env defaults (via _tag_request's
             # setdefault) and reach the template render (before orig()). This is
-            # how Claude Code -- which sets headers but not custom body fields --
+            # how header-only clients -- which set headers but not custom body fields --
             # controls the reasoning head, including over /v1/messages.
             _apply_request_headers(request, raw_request)
             _apply_output_floor(request, raw_request, cfg["min_output_tokens"],
                                 cfg["max_latent"])
+            _apply_answer_register(request, raw_request, cfg["answer_register"])
             await _ensure_installed(engine, injector, cfg)
             _tag_request(request)
         except Ds4RiderUnavailable as e:
@@ -442,6 +766,20 @@ def _make_patched_create(orig, injector):
         except Exception as e:  # noqa: BLE001 -- never break serving on addon error
             logger.warning("DS4 latent tag/install failed (%s); serving base.", e)
         result = await orig(self, request, *args, **kwargs)
+        # Latent tick stream + LPS metrics -- per-request, best-effort; never break
+        # serving. Streaming returns the chunk generator UNDRAINED (generation has
+        # not started here), so ticks pace the latent phase via the runner-stats
+        # poller and LPS is recorded on completion inside the wrapper; the
+        # non-streaming response is already final, so record LPS immediately.
+        # The external request id is deterministic pre-stream: it is
+        # ``chatcmpl-{_base_request_id(raw, req.request_id)}``, and the runner
+        # keys latent stats by ``f"{external_id}-{8hex}"`` (input_processor).
+        internal_prefix = f"chatcmpl-{self._base_request_id(raw_request, request.request_id)}-"
+        if request.stream:
+            if result is not None:
+                result = _wrap_with_latent_ticks(result, engine, internal_prefix)
+        else:
+            await _record_lps_for_request(engine, internal_prefix)
         if debug:
             # Read the rider's per-request latent diagnostics AFTER generation so
             # we can see whether the learned stop fired (end=stop) or ran to the
